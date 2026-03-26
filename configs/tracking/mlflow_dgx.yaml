@@ -1,0 +1,4 @@
+backend: mlflow
+tracking_uri: http://<DGX_SPARK_IP>:5000
+experiment_name: velodoc-llm
+log_models: false

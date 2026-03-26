@@ -1,0 +1,13 @@
+device: cuda
+distributed: deepspeed
+precision: bf16
+num_workers: 8
+tf32: true
+
+platform:
+  arch: x86_64
+  cluster: h100
+
+deepspeed:
+  zero_stage: 2
+  gradient_checkpointing: true

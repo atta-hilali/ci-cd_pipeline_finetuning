@@ -1,0 +1,6 @@
+name: lora
+method: lora
+r: 16
+alpha: 32
+dropout: 0.05
+target_modules: auto

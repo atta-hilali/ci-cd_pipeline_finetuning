@@ -1,0 +1,9 @@
+device: cpu
+distributed: none
+precision: fp32
+num_workers: 2
+tf32: false
+
+limits:
+  max_train_steps: 50
+  max_eval_samples: 50

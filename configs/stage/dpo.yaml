@@ -1,0 +1,11 @@
+name: dpo
+trainer:
+  lr: 5.0e-6
+  epochs: 1
+  micro_batch_size: 1
+  grad_accum: 16
+  beta: 0.1
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  metric_for_best: eval_reward

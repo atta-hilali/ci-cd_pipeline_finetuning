@@ -1,0 +1,24 @@
+defaults:
+  - dataset: dental_v1
+  - model: qwen3_8b
+  - stage: sft
+  - peft: lora
+  - infra: local
+  - tracking: mlflow_local
+  - _self_
+
+project:
+  name: velodoc-llm
+  run_group: default
+
+run:
+  name: ${model.name}-${stage.name}-${dataset.version}-${peft.name}
+  seed: 42
+  output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_${run.name}
+
+artifact_policy:
+  save_config_snapshot: true
+  save_tokenizer: true
+  save_checkpoints: true
+  keep_last_n: 2
+  save_best: true

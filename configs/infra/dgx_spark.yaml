@@ -1,0 +1,13 @@
+device: cuda
+distributed: deepspeed
+precision: bf16
+num_workers: 8
+tf32: true
+
+platform:
+  arch: aarch64   # DGX Spark is ARM64
+  dgx_os: true
+
+deepspeed:
+  zero_stage: 2
+  gradient_checkpointing: true

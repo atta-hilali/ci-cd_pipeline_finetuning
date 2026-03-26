@@ -1,0 +1,252 @@
+name: Train Dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Dataset config name from configs/dataset
+        required: true
+        default: dental_v1
+        type: choice
+        options:
+          - dental_v1
+      model:
+        description: Model config name from configs/model
+        required: true
+        default: qwen3_8b
+        type: choice
+        options:
+          - qwen3_8b
+          - medmo_4b
+      peft:
+        description: PEFT config name from configs/peft
+        required: true
+        default: lora
+        type: choice
+        options:
+          - lora
+          - dora
+      infra:
+        description: Infrastructure config name from configs/infra
+        required: true
+        default: local
+        type: choice
+        options:
+          - local
+          - colab_t4
+          - colab_a100
+          - dgx_spark
+          - h100_cluster
+      tracking:
+        description: Tracking config name from configs/tracking
+        required: true
+        default: mlflow_local
+        type: choice
+        options:
+          - mlflow_local
+          - mlflow_dgx
+      extra_overrides:
+        description: Extra Hydra overrides separated by spaces
+        required: false
+        default: ""
+        type: string
+      execute_training:
+        description: Run the full training job on a self-hosted runner
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    # Weekly retraining every Monday at 02:00 UTC.
+    - cron: "0 2 * * 1"
+
+concurrency:
+  group: train-dispatch-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-request:
+    runs-on: ubuntu-latest
+    outputs:
+      dataset: ${{ steps.resolve.outputs.dataset }}
+      model: ${{ steps.resolve.outputs.model }}
+      peft: ${{ steps.resolve.outputs.peft }}
+      infra: ${{ steps.resolve.outputs.infra }}
+      tracking: ${{ steps.resolve.outputs.tracking }}
+      extra_overrides: ${{ steps.resolve.outputs.extra_overrides }}
+      execute_training: ${{ steps.resolve.outputs.execute_training }}
+      trigger_mode: ${{ steps.resolve.outputs.trigger_mode }}
+
+    steps:
+      - name: Resolve workflow settings
+        id: resolve
+        env:
+          SCHEDULE_DATASET: ${{ vars.TRAIN_DATASET || 'dental_v1' }}
+          SCHEDULE_MODEL: ${{ vars.TRAIN_MODEL || 'qwen3_8b' }}
+          SCHEDULE_PEFT: ${{ vars.TRAIN_PEFT || 'lora' }}
+          SCHEDULE_INFRA: ${{ vars.TRAIN_INFRA || 'local' }}
+          SCHEDULE_TRACKING: ${{ vars.TRAIN_TRACKING || 'mlflow_local' }}
+          SCHEDULE_EXTRA_OVERRIDES: ${{ vars.TRAIN_EXTRA_OVERRIDES || '' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          event_path = Path(os.environ["GITHUB_EVENT_PATH"])
+          with event_path.open("r", encoding="utf-8") as handle:
+              event = json.load(handle)
+
+          defaults = {
+              "dataset": os.environ["SCHEDULE_DATASET"],
+              "model": os.environ["SCHEDULE_MODEL"],
+              "peft": os.environ["SCHEDULE_PEFT"],
+              "infra": os.environ["SCHEDULE_INFRA"],
+              "tracking": os.environ["SCHEDULE_TRACKING"],
+              "extra_overrides": os.environ["SCHEDULE_EXTRA_OVERRIDES"],
+              "execute_training": "true",
+          }
+
+          trigger_mode = "scheduled" if event_name == "schedule" else "manual"
+          if trigger_mode == "manual":
+              raw_inputs = event.get("inputs", {})
+              resolved = {
+                  "dataset": raw_inputs.get("dataset") or defaults["dataset"],
+                  "model": raw_inputs.get("model") or defaults["model"],
+                  "peft": raw_inputs.get("peft") or defaults["peft"],
+                  "infra": raw_inputs.get("infra") or defaults["infra"],
+                  "tracking": raw_inputs.get("tracking") or defaults["tracking"],
+                  "extra_overrides": raw_inputs.get("extra_overrides", ""),
+                  "execute_training": str(raw_inputs.get("execute_training", "false")).lower(),
+              }
+          else:
+              resolved = defaults.copy()
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as handle:
+              for key, value in resolved.items():
+                  print(f"{key}={value}", file=handle)
+              print(f"trigger_mode={trigger_mode}", file=handle)
+          PY
+
+      - name: Show workflow plan
+        run: |
+          {
+            echo "## Training Workflow Plan"
+            echo ""
+            echo "- Trigger mode: ${{ steps.resolve.outputs.trigger_mode }}"
+            echo "- Dataset: ${{ steps.resolve.outputs.dataset }}"
+            echo "- Model: ${{ steps.resolve.outputs.model }}"
+            echo "- PEFT: ${{ steps.resolve.outputs.peft }}"
+            echo "- Infra: ${{ steps.resolve.outputs.infra }}"
+            echo "- Tracking: ${{ steps.resolve.outputs.tracking }}"
+            echo "- Extra overrides: \`${{ steps.resolve.outputs.extra_overrides || 'none' }}\`"
+            echo "- Execute training: ${{ steps.resolve.outputs.execute_training }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  resolve-config:
+    needs: resolve-request
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Resolve training config
+        shell: bash
+        run: |
+          set -euo pipefail
+          overrides=(
+            "dataset=${{ needs.resolve-request.outputs.dataset }}"
+            "model=${{ needs.resolve-request.outputs.model }}"
+            "peft=${{ needs.resolve-request.outputs.peft }}"
+            "infra=${{ needs.resolve-request.outputs.infra }}"
+            "tracking=${{ needs.resolve-request.outputs.tracking }}"
+          )
+          if [ -n "${{ needs.resolve-request.outputs.extra_overrides }}" ]; then
+            read -r -a extra <<< "${{ needs.resolve-request.outputs.extra_overrides }}"
+            overrides+=("${extra[@]}")
+          fi
+          python -m velodoc_train.cli --cfg job --resolve "${overrides[@]}" | tee resolved-config.yaml
+
+      - name: Upload resolved config
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-config
+          path: resolved-config.yaml
+
+  run-training:
+    if: ${{ needs.resolve-request.outputs.execute_training == 'true' }}
+    needs:
+      - resolve-request
+      - resolve-config
+    runs-on: self-hosted
+    timeout-minutes: 720
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_REPO_PREFIX: ${{ vars.HF_REPO_PREFIX }}
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install project and optional extras
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ "${{ needs.resolve-request.outputs.infra }}" = "local" ]; then
+            pip install -e .
+          else
+            pip install -e .[deepspeed]
+          fi
+
+      - name: Launch training pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          overrides=(
+            "dataset=${{ needs.resolve-request.outputs.dataset }}"
+            "model=${{ needs.resolve-request.outputs.model }}"
+            "peft=${{ needs.resolve-request.outputs.peft }}"
+            "infra=${{ needs.resolve-request.outputs.infra }}"
+            "tracking=${{ needs.resolve-request.outputs.tracking }}"
+          )
+          if [ -n "${{ needs.resolve-request.outputs.extra_overrides }}" ]; then
+            read -r -a extra <<< "${{ needs.resolve-request.outputs.extra_overrides }}"
+            overrides+=("${extra[@]}")
+          fi
+          python -m velodoc_train.cli "${overrides[@]}"
+
+      - name: Upload training outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-outputs
+          path: |
+            outputs/**
+            mlruns/**
+          if-no-files-found: warn

@@ -1,0 +1,12 @@
+# Local experiment artifacts
+mlflow/
+mlruns/
+outputs/
+mlflow.db
+
+# Python cache/env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/

@@ -1,0 +1,9 @@
+device: cuda
+distributed: deepspeed
+precision: fp16
+num_workers: 2
+tf32: true
+
+deepspeed:
+  zero_stage: 2
+  gradient_checkpointing: true

@@ -1,0 +1,4 @@
+backend: mlflow
+tracking_uri: file:./mlruns
+experiment_name: velodoc-llm
+log_models: false

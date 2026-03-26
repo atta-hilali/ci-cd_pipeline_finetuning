@@ -1,0 +1,13 @@
+name: sft
+trainer:
+  lr: 2.0e-5
+  epochs: 1
+  micro_batch_size: 1
+  grad_accum: 16
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  metric_for_best: eval_loss
