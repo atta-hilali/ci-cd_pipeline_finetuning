@@ -3,6 +3,7 @@ import hydra
 from omegaconf import DictConfig
 from velodoc_train.utils.seed import set_global_seed
 
+from velodoc_train.training.distributed import is_main_process
 from velodoc_train.tracking.mlflow_utils import setup_mlflow
 from velodoc_train.tracking.artifacts import save_config_snapshot
 from velodoc_train.utils.env import ensure_dirs
@@ -13,6 +14,7 @@ def main(cfg: DictConfig) -> None:
     # Resolve & create output dir
     out_dir = cfg.run.output_dir
     ensure_dirs(out_dir)
+    is_main = is_main_process()
 
     # Seed
     set_global_seed(int(cfg.run.seed))
@@ -21,7 +23,7 @@ def main(cfg: DictConfig) -> None:
     mlflow_run = setup_mlflow(cfg)
 
     # Snapshot config (traceability)
-    if cfg.artifact_policy.save_config_snapshot:
+    if is_main and cfg.artifact_policy.save_config_snapshot:
         save_config_snapshot(cfg, out_dir)
         # log as artifact
         import mlflow

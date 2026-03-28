@@ -1,9 +1,12 @@
 import os
 import mlflow
+from velodoc_train.training.distributed import is_main_process
 
 def setup_mlflow(cfg):
     tracking_backend = str(cfg.tracking.backend).lower()
     if tracking_backend != "mlflow":
+        return None
+    if not is_main_process():
         return None
 
     tracking_uri = str(cfg.tracking.tracking_uri)

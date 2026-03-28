@@ -11,6 +11,7 @@ from velodoc_train.data.jsonl_loader import load_jsonl, split_train_eval
 from velodoc_train.data.registry import build_dataset_manifest, save_manifest
 from velodoc_train.models.build import load_tokenizer, load_causal_lm
 from velodoc_train.models.peft import apply_peft
+from velodoc_train.training.distributed import is_main_process
 from velodoc_train.tracking.summaries import write_summary
 from velodoc_train.utils.git import get_git_commit
 
@@ -162,28 +163,31 @@ def _load_sft_datasets(cfg: DictConfig):
     }
 
 def run_sft(cfg: DictConfig, out_dir: str) -> None:
+    process_is_main = is_main_process()
+
     # Dataset + manifest
     ds_train, ds_eval, eval_path, eval_source, split_meta = _load_sft_datasets(cfg)
 
-    manifest = build_dataset_manifest(str(cfg.dataset.path), eval_path)
-    manifest["train_num_rows"] = len(ds_train)
-    manifest["eval_num_rows"] = len(ds_eval) if ds_eval is not None else 0
-    manifest["eval_source"] = eval_source
-    if split_meta is not None:
-        manifest.update(split_meta)
-    man_path = save_manifest(manifest, out_dir)
-    mlflow.log_artifact(man_path, artifact_path="data")
-    mlflow.log_params({
-        "dataset.train_sha256": manifest["train_sha256"],
-        "dataset.eval_sha256": manifest["eval_sha256"] or "",
-        "dataset.eval_source": eval_source,
-        "git.commit": get_git_commit(),
-    })
-    if split_meta is not None:
+    if process_is_main:
+        manifest = build_dataset_manifest(str(cfg.dataset.path), eval_path)
+        manifest["train_num_rows"] = len(ds_train)
+        manifest["eval_num_rows"] = len(ds_eval) if ds_eval is not None else 0
+        manifest["eval_source"] = eval_source
+        if split_meta is not None:
+            manifest.update(split_meta)
+        man_path = save_manifest(manifest, out_dir)
+        mlflow.log_artifact(man_path, artifact_path="data")
         mlflow.log_params({
-            "dataset.eval_split_ratio": split_meta["split_ratio"],
-            "dataset.eval_split_seed": split_meta["split_seed"],
+            "dataset.train_sha256": manifest["train_sha256"],
+            "dataset.eval_sha256": manifest["eval_sha256"] or "",
+            "dataset.eval_source": eval_source,
+            "git.commit": get_git_commit(),
         })
+        if split_meta is not None:
+            mlflow.log_params({
+                "dataset.eval_split_ratio": split_meta["split_ratio"],
+                "dataset.eval_split_seed": split_meta["split_seed"],
+            })
 
     # Model/tokenizer
     tok = load_tokenizer(str(cfg.model.hf_id), trust_remote_code=bool(cfg.model.trust_remote_code))
@@ -211,37 +215,43 @@ def run_sft(cfg: DictConfig, out_dir: str) -> None:
     # Train
     train_result = trainer.train()
     metrics = train_result.metrics
-    for k, v in metrics.items():
-        if isinstance(v, (int, float)):
-            mlflow.log_metric(k, float(v))
+    trainer_is_main = trainer.is_world_process_zero()
+    if trainer_is_main:
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)):
+                mlflow.log_metric(k, float(v))
 
     # Evaluate
     if ds_eval is not None:
         eval_metrics = trainer.evaluate()
-        for k, v in eval_metrics.items():
-            if isinstance(v, (int, float)):
-                mlflow.log_metric(f"eval.{k}", float(v))
+        if trainer_is_main:
+            for k, v in eval_metrics.items():
+                if isinstance(v, (int, float)):
+                    mlflow.log_metric(f"eval.{k}", float(v))
 
     # Save best checkpoint folder (HF push uses it)
     best_dir = args.output_dir  # Trainer stores best model in output_dir when load_best_model_at_end
     # Persist tokenizer too
-    if cfg.artifact_policy.save_tokenizer:
+    if trainer_is_main and cfg.artifact_policy.save_tokenizer:
         tok_dir = os.path.join(out_dir, "tokenizer")
         tok.save_pretrained(tok_dir)
         mlflow.log_artifacts(tok_dir, artifact_path="tokenizer")
 
     # Log checkpoint dir as artifact (may be large)
-    mlflow.log_artifacts(args.output_dir, artifact_path="checkpoints")
+    if trainer_is_main:
+        mlflow.log_artifacts(args.output_dir, artifact_path="checkpoints")
 
     # Summary
-    summary_path = write_summary(out_dir, {
-        "run_name": str(cfg.run.name),
-        "model": str(cfg.model.hf_id),
-        "dataset_version": str(cfg.dataset.version),
-        "peft": str(cfg.peft.method),
-        "metrics": {**metrics},
-    })
-    mlflow.log_artifact(summary_path, artifact_path="summaries")
+    if trainer_is_main:
+        summary_path = write_summary(out_dir, {
+            "run_name": str(cfg.run.name),
+            "model": str(cfg.model.hf_id),
+            "dataset_version": str(cfg.dataset.version),
+            "peft": str(cfg.peft.method),
+            "metrics": {**metrics},
+        })
+        mlflow.log_artifact(summary_path, artifact_path="summaries")
 
     # Push best to HF (optional; requires HF_TOKEN)
-    _push_best_to_hf(cfg, best_dir)
+    if trainer_is_main:
+        _push_best_to_hf(cfg, best_dir)

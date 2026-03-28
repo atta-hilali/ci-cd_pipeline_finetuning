@@ -239,7 +239,17 @@ jobs:
             read -r -a extra <<< "${{ needs.resolve-request.outputs.extra_overrides }}"
             overrides+=("${extra[@]}")
           fi
-          python -m velodoc_train.cli "${overrides[@]}"
+          if [ "${{ needs.resolve-request.outputs.infra }}" = "local" ]; then
+            python -m velodoc_train.cli "${overrides[@]}"
+          else
+            if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+              IFS=',' read -r -a visible_devices <<< "${CUDA_VISIBLE_DEVICES}"
+              nproc_per_node="${#visible_devices[@]}"
+            else
+              nproc_per_node="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')"
+            fi
+            torchrun --standalone --nproc_per_node="${nproc_per_node}" -m velodoc_train.cli "${overrides[@]}"
+          fi
 
       - name: Upload training outputs
         if: always()
