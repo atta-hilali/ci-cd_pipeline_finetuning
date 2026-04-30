@@ -105,6 +105,8 @@ def _build_training_args(cfg: DictConfig, out_dir: str, ds_path: Optional[str], 
         args_kwargs["max_length"] = int(cfg.dataset.processing.max_seq_len)
     if "packing" in params:
         args_kwargs["packing"] = bool(cfg.dataset.processing.packing)
+    if "completion_only_loss" in params:
+        args_kwargs["completion_only_loss"] = False
 
     return args_cls(**args_kwargs)
 
@@ -178,7 +180,9 @@ def _load_sft_datasets(cfg: DictConfig):
 
 
 def _limit_eval_dataset(cfg: DictConfig, ds_eval):
-    max_eval_samples = getattr(getattr(cfg.infra, "limits", {}), "max_eval_samples", None)
+    infra = cfg.get("infra", {})
+    limits = infra.get("limits", {}) if hasattr(infra, "get") else {}
+    max_eval_samples = limits.get("max_eval_samples") if hasattr(limits, "get") else None
     if max_eval_samples is None:
         return ds_eval
     return ds_eval.select(range(min(int(max_eval_samples), len(ds_eval))))
