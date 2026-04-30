@@ -1,0 +1,8 @@
+name: gemma4-e4b-it
+hf_id: google/gemma-4-E4B-it
+dtype: bf16
+trust_remote_code: false
+attn_implementation: sdpa
+
+notes:
+  requires_hf_access: true

@@ -2,6 +2,7 @@ import os
 import hydra
 from omegaconf import DictConfig
 from velodoc_train.utils.seed import set_global_seed
+from velodoc_train.utils.config_validation import validate_config
 
 from velodoc_train.training.distributed import is_main_process
 from velodoc_train.tracking.mlflow_utils import setup_mlflow
@@ -11,6 +12,8 @@ from velodoc_train.utils.env import ensure_dirs
 
 @hydra.main(config_path="../../configs", config_name="configs", version_base=None)
 def main(cfg: DictConfig) -> None:
+    validate_config(cfg)
+
     # Resolve & create output dir
     out_dir = cfg.run.output_dir
     ensure_dirs(out_dir)
@@ -29,21 +32,22 @@ def main(cfg: DictConfig) -> None:
         import mlflow
         mlflow.log_artifact(os.path.join(out_dir, "config_resolved.yaml"), artifact_path="config")
 
-    # Dispatch stage
-    stage = str(cfg.stage.name).lower()
-    if stage == "sft":
-        from velodoc_train.sft_train import run_sft
+    try:
+        # Dispatch stage
+        stage = str(cfg.stage.name).lower()
+        if stage == "sft":
+            from velodoc_train.sft_train import run_sft
 
-        run_sft(cfg, out_dir)
-    elif stage == "dpo":
-        raise NotImplementedError("DPO stage is configured but no DPO trainer module exists in this repository yet.")
-    else:
-        raise ValueError(f"Unknown stage: {stage}")
-
-    # Finish
-    if mlflow_run is not None:
-        import mlflow
-        mlflow.end_run()
+            run_sft(cfg, out_dir)
+        elif stage == "dpo":
+            raise NotImplementedError("DPO stage is configured but no DPO trainer module exists in this repository yet.")
+        else:
+            raise ValueError(f"Unknown stage: {stage}")
+    finally:
+        # Finish
+        if mlflow_run is not None:
+            import mlflow
+            mlflow.end_run()
 
 if __name__ == "__main__":
     main()

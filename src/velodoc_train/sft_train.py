@@ -1,6 +1,7 @@
 import os
 import json
 import inspect
+import re
 import mlflow
 from typing import Optional
 from omegaconf import DictConfig
@@ -39,13 +40,17 @@ def _maybe_write_deepspeed_config(cfg: DictConfig, out_dir: str) -> Optional[str
     return p
 
 def _push_best_to_hf(cfg: DictConfig, best_dir: str):
+    if os.getenv("HF_PUSH_TO_HUB", "").lower() not in {"1", "true", "yes"}:
+        return
     hf_token = os.getenv("HF_TOKEN")
     if not hf_token:
         return
     prefix = os.getenv("HF_REPO_PREFIX", "VelodocAI")
-    repo_id = f"{prefix}/{cfg.run.name}"
+    repo_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(cfg.run.name)).strip(".-")
+    repo_id = f"{prefix}/{repo_name}"
+    private = os.getenv("HF_PRIVATE_REPO", "1").lower() not in {"0", "false", "no"}
     api = HfApi(token=hf_token)
-    api.create_repo(repo_id, repo_type="model", exist_ok=True, private=False)
+    api.create_repo(repo_id, repo_type="model", exist_ok=True, private=private)
     api.upload_folder(
         repo_id=repo_id,
         folder_path=best_dir,
@@ -86,11 +91,16 @@ def _build_training_args(cfg: DictConfig, out_dir: str, ds_path: Optional[str], 
 
     if "dataloader_num_workers" in params:
         args_kwargs["dataloader_num_workers"] = int(cfg.infra.num_workers)
+    max_train_steps = getattr(getattr(cfg.infra, "limits", {}), "max_train_steps", None)
+    if max_train_steps is not None and "max_steps" in params:
+        args_kwargs["max_steps"] = int(max_train_steps)
     if "use_cpu" in params:
         args_kwargs["use_cpu"] = str(cfg.infra.device).lower() == "cpu"
     if "gradient_checkpointing" in params:
         gc_enabled = bool(getattr(getattr(cfg.infra, "deepspeed", {}), "gradient_checkpointing", False))
         args_kwargs["gradient_checkpointing"] = gc_enabled
+    if "ddp_find_unused_parameters" in params:
+        args_kwargs["ddp_find_unused_parameters"] = False
     if "max_length" in params:
         args_kwargs["max_length"] = int(cfg.dataset.processing.max_seq_len)
     if "packing" in params:
@@ -137,10 +147,12 @@ def _load_sft_datasets(cfg: DictConfig):
         if eval_path is None:
             raise FileNotFoundError(f"Validation file not found: {raw_eval_path}")
         ds_eval = load_jsonl(eval_path, limit=None)
+        ds_eval = _limit_eval_dataset(cfg, ds_eval)
         return ds_train, ds_eval, eval_path, "file", None
 
     if strategy == "split":
         ds_train, ds_eval = split_train_eval(ds_train, eval_ratio=split_ratio, seed=split_seed)
+        ds_eval = _limit_eval_dataset(cfg, ds_eval)
         return ds_train, ds_eval, None, "split", {
             "split_ratio": split_ratio,
             "split_seed": split_seed,
@@ -149,6 +161,7 @@ def _load_sft_datasets(cfg: DictConfig):
 
     if eval_path is not None:
         ds_eval = load_jsonl(eval_path, limit=None)
+        ds_eval = _limit_eval_dataset(cfg, ds_eval)
         return ds_train, ds_eval, eval_path, "file", None
 
     print(
@@ -156,11 +169,19 @@ def _load_sft_datasets(cfg: DictConfig):
         f"creating a validation split from train data with ratio={split_ratio} and seed={split_seed}."
     )
     ds_train, ds_eval = split_train_eval(ds_train, eval_ratio=split_ratio, seed=split_seed)
+    ds_eval = _limit_eval_dataset(cfg, ds_eval)
     return ds_train, ds_eval, None, "split", {
         "split_ratio": split_ratio,
         "split_seed": split_seed,
         "missing_eval_path": raw_eval_path,
     }
+
+
+def _limit_eval_dataset(cfg: DictConfig, ds_eval):
+    max_eval_samples = getattr(getattr(cfg.infra, "limits", {}), "max_eval_samples", None)
+    if max_eval_samples is None:
+        return ds_eval
+    return ds_eval.select(range(min(int(max_eval_samples), len(ds_eval))))
 
 def run_sft(cfg: DictConfig, out_dir: str) -> None:
     process_is_main = is_main_process()
@@ -191,7 +212,14 @@ def run_sft(cfg: DictConfig, out_dir: str) -> None:
 
     # Model/tokenizer
     tok = load_tokenizer(str(cfg.model.hf_id), trust_remote_code=bool(cfg.model.trust_remote_code))
-    model = load_causal_lm(str(cfg.model.hf_id), dtype=str(cfg.model.dtype), trust_remote_code=bool(cfg.model.trust_remote_code))
+    model = load_causal_lm(
+        str(cfg.model.hf_id),
+        dtype=str(cfg.model.dtype),
+        trust_remote_code=bool(cfg.model.trust_remote_code),
+        attn_implementation=cfg.model.get("attn_implementation"),
+    )
+    if bool(getattr(getattr(cfg.infra, "deepspeed", {}), "gradient_checkpointing", False)):
+        model.config.use_cache = False
     model = apply_peft(model, {
         "method": str(cfg.peft.method),
         "r": int(cfg.peft.r),

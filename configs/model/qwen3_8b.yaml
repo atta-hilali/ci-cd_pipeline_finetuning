@@ -1,4 +1,5 @@
 name: qwen3-8b
 hf_id: Qwen/Qwen3-8B
 dtype: bf16
-trust_remote_code: true
+trust_remote_code: false
+attn_implementation: sdpa

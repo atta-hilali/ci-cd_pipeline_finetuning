@@ -2,3 +2,7 @@ name: medmo-4b
 hf_id: MBZUAI/MedMo-4B
 dtype: bf16
 trust_remote_code: true
+attn_implementation: sdpa
+
+security:
+  remote_code_review_required: true

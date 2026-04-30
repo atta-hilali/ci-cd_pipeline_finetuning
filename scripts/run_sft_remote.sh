@@ -4,10 +4,11 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
 DATASET=${DATASET:-dental_v1}
-MODEL=${MODEL:-qwen3_8b}
+MODEL=${MODEL:-gemma4_e2b_it}
 PEFT=${PEFT:-dora}
 INFRA=${INFRA:-dgx_spark}
 TRACKING=${TRACKING:-mlflow_dgx}

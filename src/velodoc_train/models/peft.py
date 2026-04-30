@@ -1,5 +1,15 @@
 from peft import LoraConfig, get_peft_model
 
+
+def _infer_target_modules(model):
+    model_type = str(getattr(model.config, "model_type", "")).lower()
+    if "gemma" in model_type:
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    if "qwen" in model_type:
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    return None
+
+
 def apply_peft(model, peft_cfg: dict):
     method = peft_cfg["method"].lower()
     if method not in ("lora", "dora"):
@@ -9,9 +19,8 @@ def apply_peft(model, peft_cfg: dict):
     use_dora = (method == "dora")
 
     target_modules = peft_cfg.get("target_modules", "auto")
-    # "auto" means let PEFT infer (works for many HF models). You can hardcode later.
     if target_modules == "auto":
-        target_modules = None
+        target_modules = _infer_target_modules(model)
 
     lora = LoraConfig(
         r=int(peft_cfg["r"]),
