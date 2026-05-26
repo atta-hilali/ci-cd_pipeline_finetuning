@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument("--baseline-model", required=True, help="Baseline model id/path, for example a local MedGemma path.")
     parser.add_argument("--prompt-file", help="Optional txt/jsonl file with prompts.")
     parser.add_argument("--output-jsonl", default="comparison_outputs.jsonl", help="Where to save generations.")
-    parser.add_argument("--max-new-tokens", type=int, default=250)
+    parser.add_argument("--max-new-tokens", type=int, default=489)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--trust-remote-code", action="store_true")
