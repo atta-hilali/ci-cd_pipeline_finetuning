@@ -3,6 +3,17 @@ from peft import LoraConfig, get_peft_model
 
 def _infer_target_modules(model):
     model_type = str(getattr(model.config, "model_type", "")).lower()
+    module_class_names = {module.__class__.__name__ for module in model.modules()}
+    if "gemma4" in model_type or "Gemma4ClippableLinear" in module_class_names:
+        return [
+            "q_proj.linear",
+            "k_proj.linear",
+            "v_proj.linear",
+            "o_proj.linear",
+            "gate_proj.linear",
+            "up_proj.linear",
+            "down_proj.linear",
+        ]
     if "gemma" in model_type:
         return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     if "qwen" in model_type:
