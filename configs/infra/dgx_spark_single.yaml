@@ -1,0 +1,13 @@
+device: cuda
+distributed: none
+precision: bf16
+num_workers: 8
+tf32: true
+
+platform:
+  arch: aarch64
+  dgx_os: true
+  profile: single_gpu
+
+deepspeed:
+  gradient_checkpointing: true

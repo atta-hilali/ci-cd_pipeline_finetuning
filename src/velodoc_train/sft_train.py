@@ -107,6 +107,8 @@ def _build_training_args(cfg: DictConfig, out_dir: str, ds_path: Optional[str], 
         args_kwargs["packing"] = bool(cfg.dataset.processing.packing)
     if "completion_only_loss" in params:
         args_kwargs["completion_only_loss"] = False
+    if "dataset_text_field" in params:
+        args_kwargs["dataset_text_field"] = "text"
 
     return args_cls(**args_kwargs)
 
@@ -117,17 +119,23 @@ def _build_sft_trainer(model, tok, ds_train, ds_eval, args, max_seq_len: int):
     def format_fn(ex):
         return f"{ex['prompt']}\n\nAssistant: {ex['completion']}"
 
+    def to_text_dataset(ds):
+        if ds is None:
+            return None
+        return ds.map(lambda ex: {"text": format_fn(ex)}, remove_columns=ds.column_names)
+
     trainer_kwargs = {
         "model": model,
-        "train_dataset": ds_train,
-        "eval_dataset": ds_eval,
-        "formatting_func": format_fn,
+        "train_dataset": to_text_dataset(ds_train),
+        "eval_dataset": to_text_dataset(ds_eval),
         "args": args,
     }
     if "tokenizer" in trainer_params:
         trainer_kwargs["tokenizer"] = tok
     if "processing_class" in trainer_params:
         trainer_kwargs["processing_class"] = tok
+    if "dataset_text_field" in trainer_params:
+        trainer_kwargs["dataset_text_field"] = "text"
     if "max_seq_length" in trainer_params:
         trainer_kwargs["max_seq_length"] = max_seq_len
 
