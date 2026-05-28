@@ -4,6 +4,7 @@ import json
 import os
 import statistics
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -270,8 +271,15 @@ def query_openai_server(server_url, server_model, prompt, max_tokens, temperatur
     text_parts = []
     done_metrics = {}
     start = time.perf_counter()
-    with urllib.request.urlopen(request, timeout=600) as response:
-        body = response.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(request, timeout=600) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Server returned HTTP {exc.code} for {server_url}. "
+            f"Response body: {error_body}"
+        ) from exc
     wall_sec = time.perf_counter() - start
 
     for raw_line in body.splitlines():
