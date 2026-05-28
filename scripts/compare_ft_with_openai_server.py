@@ -9,14 +9,41 @@ from pathlib import Path
 
 import torch
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+
+
+DENTIST_COPILOT_INSTRUCTION = (
+    "You are a dentist co-pilot assisting a licensed dentist. "
+    "Give concise, clinically useful support for triage, differential considerations, "
+    "chairside next steps, patient education, and documentation. "
+    "Do not claim to replace professional judgment."
+)
 
 
 DEFAULT_PROMPTS = [
-    "What are common causes of tooth sensitivity?",
-    "A patient has bleeding gums while brushing. What should they do?",
-    "Explain the difference between gingivitis and periodontitis.",
-    "What warning signs mean a dental patient should seek urgent care?",
+    (
+        "A 34-year-old patient reports sharp pain on cold drinks in the upper right molar region. "
+        "No swelling, no fever. Help the dentist structure the likely causes, key questions, exam checks, "
+        "and initial chairside management."
+    ),
+    (
+        "A patient has bleeding gums while brushing and generalized plaque accumulation. "
+        "Prepare a dentist co-pilot response with differential considerations, periodontal assessment steps, "
+        "patient education, and when to schedule scaling/root planing."
+    ),
+    (
+        "During a consultation, a patient asks whether their gum problem is gingivitis or periodontitis. "
+        "Draft a dentist-facing explanation, what findings distinguish them, and what should be documented."
+    ),
+    (
+        "A patient calls after extraction with increasing pain on day 3, bad taste, and no fever. "
+        "Help the dentist triage dry socket versus infection, list red flags, and suggest next actions."
+    ),
+    (
+        "A child presents with dental trauma after a fall. The parent says a front tooth is loose. "
+        "Provide a dentist co-pilot checklist for urgent questions, primary versus permanent tooth considerations, "
+        "and immediate advice before examination."
+    ),
 ]
 
 
@@ -29,6 +56,11 @@ def parse_args():
     parser.add_argument("--server-url", default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--server-model", default="medgemma")
     parser.add_argument("--server-label", default="server")
+    parser.add_argument(
+        "--task-instruction",
+        default=DENTIST_COPILOT_INSTRUCTION,
+        help="Instruction prepended to every prompt. Use '' to disable.",
+    )
     parser.add_argument("--prompt-file", help="Optional txt/jsonl file containing prompts.")
     parser.add_argument("--run", choices=("both", "ft", "server"), default="both")
     parser.add_argument("--output-jsonl", default="ft_vs_server_comparison.jsonl")
@@ -36,10 +68,12 @@ def parse_args():
     parser.add_argument("--edge-report-md", default="edge_readiness_report.md")
     parser.add_argument("--edge-vram-gb", default="8,12,16,24,32")
     parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--do-sample", action="store_true")
-    parser.add_argument("--repetition-penalty", type=float, default=1.15)
-    parser.add_argument("--no-repeat-ngram-size", type=int, default=4)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=0)
+    parser.add_argument("--stop", action="append", default=[], help="Optional stop string. Repeat for multiple stops.")
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
@@ -93,9 +127,29 @@ def prompt_for_model(tokenizer, text, prompt_format):
     return prompt_for_sft(text)
 
 
+def apply_task_instruction(prompt, task_instruction):
+    if not task_instruction:
+        return prompt
+    return f"{task_instruction}\n\nDentist co-pilot task:\n{prompt}"
+
+
 def sync_cuda():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+class StopOnText(StoppingCriteria):
+    def __init__(self, tokenizer, prompt_token_count, stop_strings):
+        self.tokenizer = tokenizer
+        self.prompt_token_count = prompt_token_count
+        self.stop_strings = tuple(stop_strings)
+
+    def __call__(self, input_ids, scores, **kwargs):
+        if not self.stop_strings:
+            return False
+        generated = input_ids[0][self.prompt_token_count:]
+        text = self.tokenizer.decode(generated, skip_special_tokens=False)
+        return any(text.endswith(stop) for stop in self.stop_strings)
 
 
 def describe_model(model):
@@ -140,9 +194,11 @@ def generate_ft(
     prompt_format,
     max_new_tokens,
     temperature,
+    top_p,
     do_sample,
     repetition_penalty,
     no_repeat_ngram_size,
+    stop_strings,
 ):
     text = prompt_for_model(tokenizer, prompt, prompt_format)
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
@@ -161,6 +217,11 @@ def generate_ft(
     }
     if do_sample:
         generate_kwargs["temperature"] = temperature
+        generate_kwargs["top_p"] = top_p
+    if stop_strings:
+        generate_kwargs["stopping_criteria"] = StoppingCriteriaList(
+            [StopOnText(tokenizer, int(inputs["input_ids"].shape[-1]), stop_strings)]
+        )
     with torch.no_grad():
         output = model.generate(**generate_kwargs)
     sync_cuda()
@@ -188,13 +249,16 @@ def generate_ft(
     return response, metrics
 
 
-def query_openai_server(server_url, server_model, prompt, max_tokens, temperature):
+def query_openai_server(server_url, server_model, prompt, max_tokens, temperature, top_p, stop_strings):
     payload = {
         "model": server_model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "top_p": top_p,
     }
+    if stop_strings:
+        payload["stop"] = stop_strings
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         server_url,
@@ -290,6 +354,18 @@ def count_true(rows, path):
 
 def build_summary(args, rows, ft_model_stats):
     return {
+        "benchmark_config": {
+            "task_instruction": args.task_instruction,
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "do_sample": args.do_sample,
+            "repetition_penalty": args.repetition_penalty,
+            "no_repeat_ngram_size": args.no_repeat_ngram_size,
+            "stop": args.stop,
+            "dtype": args.dtype,
+            "batch_size": 1,
+        },
         "fine_tuned": {
             "label": args.ft_label,
             "base_model": args.ft_base_model,
@@ -395,18 +471,21 @@ def main():
     rows = []
     for index, prompt in enumerate(prompts, start=1):
         print(f"Running prompt {index}/{len(prompts)}...")
-        row = {"prompt": prompt}
+        effective_prompt = apply_task_instruction(prompt, args.task_instruction)
+        row = {"prompt": prompt, "effective_prompt": effective_prompt}
         if run_ft:
             ft_response, ft_metrics = generate_ft(
                 tokenizer,
                 ft_model,
-                prompt,
+                effective_prompt,
                 args.ft_prompt_format,
                 args.max_new_tokens,
                 args.temperature,
+                args.top_p,
                 args.do_sample,
                 args.repetition_penalty,
                 args.no_repeat_ngram_size,
+                args.stop,
             )
             row["fine_tuned"] = ft_response
             row["fine_tuned_metrics"] = ft_metrics
@@ -414,9 +493,11 @@ def main():
             server_response, server_metrics = query_openai_server(
                 args.server_url,
                 args.server_model,
-                prompt,
+                effective_prompt,
                 args.max_new_tokens,
                 args.temperature,
+                args.top_p,
+                args.stop,
             )
             row["server_model"] = args.server_model
             row["server_label"] = args.server_label
@@ -438,6 +519,9 @@ def main():
     for index, row in enumerate(rows, start=1):
         print(f"\n=== Prompt {index} ===")
         print(row["prompt"])
+        if row.get("effective_prompt") != row["prompt"]:
+            print("\n--- Shared dentist co-pilot prompt sent to both models ---")
+            print(row["effective_prompt"])
         if "fine_tuned" in row:
             print(f"\n--- {args.ft_label} ---")
             print(row["fine_tuned"])
