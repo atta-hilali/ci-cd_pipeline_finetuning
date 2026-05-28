@@ -24,16 +24,22 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Compare a local PEFT adapter against an OpenAI-style server.")
     parser.add_argument("--ft-base-model")
     parser.add_argument("--ft-adapter-dir")
+    parser.add_argument("--ft-label", default="fine_tuned")
+    parser.add_argument("--ft-prompt-format", choices=("sft", "chat"), default="chat")
     parser.add_argument("--server-url", default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--server-model", default="medgemma")
+    parser.add_argument("--server-label", default="server")
     parser.add_argument("--prompt-file", help="Optional txt/jsonl file containing prompts.")
     parser.add_argument("--run", choices=("both", "ft", "server"), default="both")
     parser.add_argument("--output-jsonl", default="ft_vs_server_comparison.jsonl")
     parser.add_argument("--summary-json", default="ft_vs_server_summary.json")
     parser.add_argument("--edge-report-md", default="edge_readiness_report.md")
     parser.add_argument("--edge-vram-gb", default="8,12,16,24,32")
-    parser.add_argument("--max-new-tokens", type=int, default=250)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--do-sample", action="store_true")
+    parser.add_argument("--repetition-penalty", type=float, default=1.15)
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=4)
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
@@ -73,6 +79,18 @@ def prompt_for_sft(text):
     if "Assistant:" in text:
         return text
     return f"{text}\n\nAssistant:"
+
+
+def prompt_for_model(tokenizer, text, prompt_format):
+    if prompt_format == "chat":
+        if not getattr(tokenizer, "chat_template", None):
+            raise ValueError("The tokenizer has no chat template. Use --ft-prompt-format sft for this model.")
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    return prompt_for_sft(text)
 
 
 def sync_cuda():
@@ -115,33 +133,50 @@ def load_ft_model(base_model, adapter_dir, dtype_name, trust_remote_code):
     return tokenizer, model
 
 
-def generate_ft(tokenizer, model, prompt, max_new_tokens, temperature):
-    text = prompt_for_sft(prompt)
+def generate_ft(
+    tokenizer,
+    model,
+    prompt,
+    prompt_format,
+    max_new_tokens,
+    temperature,
+    do_sample,
+    repetition_penalty,
+    no_repeat_ngram_size,
+):
+    text = prompt_for_model(tokenizer, prompt, prompt_format)
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     sync_cuda()
     start = time.perf_counter()
+    generate_kwargs = {
+        **inputs,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "repetition_penalty": repetition_penalty,
+        "no_repeat_ngram_size": no_repeat_ngram_size,
+        "pad_token_id": tokenizer.eos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    if do_sample:
+        generate_kwargs["temperature"] = temperature
     with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=temperature > 0,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        output = model.generate(**generate_kwargs)
     sync_cuda()
     elapsed_sec = time.perf_counter() - start
 
     input_tokens = int(inputs["input_ids"].shape[-1])
     output_tokens = int(output.shape[-1])
     generated_tokens = max(output_tokens - input_tokens, 0)
-    decoded = tokenizer.decode(output[0], skip_special_tokens=True)
-    response = decoded[len(text):].strip() if decoded.startswith(text) else decoded.strip()
+    generated = output[0][input_tokens:]
+    response = tokenizer.decode(generated, skip_special_tokens=True).strip()
     metrics = {
         "latency_sec": round(elapsed_sec, 3),
         "generated_tokens": generated_tokens,
         "tokens_per_sec": round(generated_tokens / elapsed_sec, 3) if elapsed_sec > 0 else None,
+        "hit_max_new_tokens": generated_tokens >= max_new_tokens,
+        "prompt_format": prompt_format,
     }
     if torch.cuda.is_available():
         metrics.update(
@@ -239,9 +274,24 @@ def max_numeric(rows, path):
     return round(max(values), 3) if values else None
 
 
+def count_true(rows, path):
+    count = 0
+    for row in rows:
+        value = row
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value[key]
+        if value is True:
+            count += 1
+    return count
+
+
 def build_summary(args, rows, ft_model_stats):
     return {
         "fine_tuned": {
+            "label": args.ft_label,
             "base_model": args.ft_base_model,
             "adapter_dir": args.ft_adapter_dir,
             "model_stats": ft_model_stats,
@@ -249,8 +299,10 @@ def build_summary(args, rows, ft_model_stats):
             "avg_tokens_per_sec": mean_numeric(rows, ("fine_tuned_metrics", "tokens_per_sec")),
             "max_cuda_peak_reserved_gb": max_numeric(rows, ("fine_tuned_metrics", "cuda_peak_reserved_gb")),
             "max_cuda_peak_allocated_gb": max_numeric(rows, ("fine_tuned_metrics", "cuda_peak_allocated_gb")),
+            "responses_hit_max_new_tokens": count_true(rows, ("fine_tuned_metrics", "hit_max_new_tokens")),
         },
         "server": {
+            "label": args.server_label,
             "model": args.server_model,
             "url": args.server_url,
             "avg_wall_latency_sec": mean_numeric(rows, ("server_metrics", "wall_latency_sec")),
@@ -285,16 +337,18 @@ def write_edge_report(path, summary, edge_vram_gb):
         "",
         "## Summary",
         "",
+        f"- Fine-tuned model: `{summary['fine_tuned']['label']}`",
         f"- Fine-tuned adapter base: `{summary['fine_tuned']['base_model']}`",
         f"- Fine-tuned average tokens/sec: `{summary['fine_tuned']['avg_tokens_per_sec']}`",
         f"- Fine-tuned peak reserved VRAM GB: `{ft_required}`",
-        f"- Server model: `{summary['server']['model']}`",
+        f"- Fine-tuned responses cut by max token limit: `{summary['fine_tuned']['responses_hit_max_new_tokens']}`",
+        f"- Server model: `{summary['server']['label']}` / `{summary['server']['model']}`",
         f"- Server average reported tokens/sec: `{summary['server']['avg_reported_tokens_per_sec']}`",
         f"- Server reported VRAM GB: `{server_required}`",
         "",
         "## Edge Fit Estimate",
         "",
-        "| Edge VRAM/RAM GB | Fine-tuned Qwen adapter | MedGemma server |",
+        f"| Edge VRAM/RAM GB | {summary['fine_tuned']['label']} | {summary['server']['label']} |",
         "| ---: | --- | --- |",
     ]
 
@@ -308,7 +362,7 @@ def write_edge_report(path, summary, edge_vram_gb):
             "",
             "## Notes",
             "",
-            "- A PEFT adapter does not make the base model smaller at inference time; Qwen3-8B still needs the Qwen3-8B base plus the adapter.",
+            "- A PEFT adapter does not make the base model smaller at inference time; the base model still has to be loaded with the adapter.",
             "- If a model is marked `quantization likely needed`, test 4-bit or 8-bit inference before deciding it can run on edge hardware.",
             "- Server timings include HTTP and streaming overhead. Fine-tuned timings are direct local generation timings.",
             "- For fair GPU numbers, benchmark one model at a time. If the MedGemma Docker server is running while Qwen is loaded, both can compete for VRAM and compute.",
@@ -343,7 +397,17 @@ def main():
         print(f"Running prompt {index}/{len(prompts)}...")
         row = {"prompt": prompt}
         if run_ft:
-            ft_response, ft_metrics = generate_ft(tokenizer, ft_model, prompt, args.max_new_tokens, args.temperature)
+            ft_response, ft_metrics = generate_ft(
+                tokenizer,
+                ft_model,
+                prompt,
+                args.ft_prompt_format,
+                args.max_new_tokens,
+                args.temperature,
+                args.do_sample,
+                args.repetition_penalty,
+                args.no_repeat_ngram_size,
+            )
             row["fine_tuned"] = ft_response
             row["fine_tuned_metrics"] = ft_metrics
         if run_server:
@@ -355,6 +419,7 @@ def main():
                 args.temperature,
             )
             row["server_model"] = args.server_model
+            row["server_label"] = args.server_label
             row["server_response"] = server_response
             row["server_metrics"] = server_metrics
         rows.append(row)
@@ -374,11 +439,11 @@ def main():
         print(f"\n=== Prompt {index} ===")
         print(row["prompt"])
         if "fine_tuned" in row:
-            print("\n--- Fine-tuned Qwen adapter ---")
+            print(f"\n--- {args.ft_label} ---")
             print(row["fine_tuned"])
             print(f"\nMetrics: {row['fine_tuned_metrics']}")
         if "server_response" in row:
-            print(f"\n--- {args.server_model} server ---")
+            print(f"\n--- {args.server_label} ---")
             print(row["server_response"])
             print(f"\nMetrics: {row['server_metrics']}")
 
