@@ -59,3 +59,27 @@ Hub upload is opt-in. Set `HF_PUSH_TO_HUB=1` to upload checkpoints. Uploads are 
 ## Gemma 4 Notes
 
 The default remote model is `configs/model/gemma4_e2b_it.yaml`, using `google/gemma-4-E2B-it`. Larger Gemma 4 variants can be added as separate model configs with the same fields, then selected with `MODEL=<config_name>`.
+
+## Merge PEFT Adapter For Serving
+
+Fine-tuning saves a PEFT adapter, not a full standalone model. For serving with vLLM or a model server, merge the adapter into the base model first:
+
+```bash
+python scripts/merge_peft_adapter.py \
+  --base-model google/gemma-4-E2B-it \
+  --adapter-dir outputs/2026-05-26/22-05-30_gemma4-e2b-it-sft-v1.3-dental-gcc-dora/checkpoints/checkpoint-3037 \
+  --output-dir outputs/merged/gemma4_e2b_it_ft_merged \
+  --dtype bf16 \
+  --max-shard-size 4GB
+```
+
+Then serve the merged model:
+
+```bash
+vllm serve outputs/merged/gemma4_e2b_it_ft_merged \
+  --host 0.0.0.0 \
+  --port 8081 \
+  --dtype bfloat16 \
+  --max-model-len 4096 \
+  --gpu-memory-utilization 0.85
+```
